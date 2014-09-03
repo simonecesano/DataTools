@@ -1,6 +1,6 @@
 use DBIx::Class::Schema::Loader;
 use Data::Dump qw/dump/;
-
+use List::Util qw/first/;
 use Getopt::Long::Descriptive;
 
 $\ = "\n"; $, = "\t";
@@ -9,11 +9,14 @@ my ($opt, $usage) =
     describe_options(
 		     $0 . ' %o <database> <table> <text-file>',
 		     [ 'populate|p',     "populate table" ],
-		     [ 'add|A',     "add content" ],
+		     [ 'add|a',     "add content", { implies => 'populate' } ],
+		     [ 'filter|f:s',     "filter rows" ],
+		     [ 'check|c',     "check after loading" ],
 		     [],
-		     [ 'missing_columns|m:s',      "print missing columns (table, input or both)" ],
 		     [ 'table_columns|C',     "print table columns" ],
-		     [ 'tables|T',     "print table names and exit" ],
+		     [ 'tables|T',     "print table names" ],
+		     [ 'header|H',     "print file header" ],
+		     [ 'missing_columns|M',      "print missing columns" ],
 		     [],
 		     [ 'verbose|v',  "print extra stuff"            ],
 		     [ 'help|h',       "print usage message and exit" ],
@@ -25,71 +28,65 @@ my ($db, $table, $file) = @ARGV;
 
 DBIx::Class::Schema::Loader->naming('current');
 my $s = DBIx::Class::Schema::Loader->connect('dbi:SQLite:' . $db) || die "database connection failed";
-
-
-my $source;
-for ($s->sources) {
-    if ($s->class($_)->table eq $table) {
-	@table_columns = $s->class($_)->columns;
-	$source = $_;
-	last;
-    }
-}
-
-if ($opt->tables) {
-    for ($s->sources) {
-	print $_, $s->class($_)->table;
-    }
-    exit;
-}
-if ($opt->table_columns) {
-    print join ', ', @table_columns;
-}
+my $source = first { $s->class($_)->table eq $table } $s->sources;
+my @columns = $s->class($source)->columns;
+my @keys = $s->resultset($source)->result_source->primary_columns;
 
 #----------------------------
 # opening the file here
 #----------------------------
 
-open my $file, '<', $file;
-%file_head = map { $_ => $i++ } mogrify(split /\t/, <$file>);
+
+#--------------------------------------------------------------------------------------------------
+#
+#--------------------------------------------------------------------------------------------------
+
+if ($opt->tables) { print $_, $s->class($_)->table for ($s->sources) };
+if ($opt->table_columns) { print join ', ', @columns };
+exit if $opt->tables || $opt->table_columns; 
 
 
 #----------------------------
 # start output
 #----------------------------
 
-if ($opt->missing_columns) {
-    use Set::Scalar;
-    my $file_head     = Set::Scalar->new(keys %file_head);
-    my $table_columns = Set::Scalar->new(@table_columns);
-    
-    print "Missing following columns in input: " . join ', ', $table_columns->difference($file_head)->members
-	if $table_columns->difference($file_head)->members && $opt->missing_columns =~ /^i|^b/i ;
-    print "Missing following columns in table: " . join ', ', $file_head->difference($table_columns)->members
-	if $file_head->difference($table_columns)->members && $opt->missing_columns =~ /^t|^b/i ;
+if ($file) { open $file, '<', $file } else { $file = *STDIN };
+my %head = map { $_ => $i++ } mogrify(split /\t/, <$file>);
+# if ($opt->header) { print  join ', ', sort { $head{$a} <=> $head{$b} } keys %head };
 
-    exit if $opt->missing_columns;
-}
-my @out_cols = map { s/^$/xx/; $_; } @file_head{@table_columns};
-
-
+my @out = map { defined $_ ? $_ : (1 + scalar keys %head) } @head{@columns};
 
 if ($opt->populate) {
-    my @rows;
-    push @rows, [ @table_columns ];
-    
-    while (<$file>) {
-	chop;
-	my @data = split /\t/;
-	push @rows, [ @data[@out_cols] ];
+    my @rows = map { s/\n//; $_ } <$file>;
+
+    if ($opt->filter) {
+	my $f;
+	if (ref eval $opt->filter) { $f = eval $opt->filter } else { $f = quotemeta($opt->filter); $f = qr/$f/ }
+    	@rows = grep { /$f/ } @rows;
     }
     
+    @rows = map { [ @{[ split /\t/ ]}[@out] ] } @rows;
+    unshift @rows, [ @columns ];
+
+    if (@keys) {
+	my @out = (shift @rows); map { unless ($u{join '::', @{$_}[@keys]}++) { push @out, $_ } } @rows;
+	@rows = @out;
+    }
+
     # there should be a transaction around this
+    printf STDERR "table contains %d rows before load\n", $s->resultset($source)->search->count if $opt->check;
     {
 	$s->resultset($source)->search->delete unless $opt->add;;
 	$s->resultset($source)->populate(\@rows);
     }
+    printf STDERR "loaded %d rows\n", (scalar @rows) - 1 if $opt->check;
+    printf STDERR "table contains %d rows after load\n", $s->resultset($source)->search->count if $opt->check;
 }
+
+if ($opt->missing_columns) {
+    print "Missing following columns in input: " . join ', ',  grep { !(defined $head{$_}) } @columns;
+}
+
 
 sub mogrify {
     my @d = @_;
