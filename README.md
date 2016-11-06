@@ -18,7 +18,7 @@
     	-v --verbose               print extra stuff
     	-h --help                  print usage message and exit
 
-# sqltoo.pl
+# sqltool.pl
 
 This tool creates SQL snippets from input data.
 
